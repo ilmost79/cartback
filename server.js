@@ -1,0 +1,505 @@
+// Cartback — abandoned checkout recovery via Vapi, with full lifecycle tracking
+// Tracks each abandoned checkout through: scheduled → called → answered/missed → recovered
+
+import express from 'express';
+import crypto from 'crypto';
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// --- Env vars (see .env.example) ---
+const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET;
+const VAPI_API_KEY = process.env.VAPI_API_KEY;
+const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID;
+const VAPI_PHONE_NUMBER_ID = process.env.VAPI_PHONE_NUMBER_ID;
+const DELAY_MIN = parseInt(process.env.ABANDON_DELAY_MINUTES || '2');
+const DELAY_MS = DELAY_MIN * 60 * 1000;
+const MODE = (process.env.MODE || 'test').toLowerCase();
+const ALLOWED_PHONES = (process.env.ALLOWED_PHONES || '')
+  .split(',').map(p => p.trim()).filter(Boolean);
+const STATS_SECRET = process.env.STATS_SECRET || '';
+
+// --- State (in-memory, resets on restart) ---
+// Each abandoned checkout is one record with its full lifecycle.
+const checkouts = new Map();        // checkoutId -> CheckoutRecord
+const callIdToCheckout = new Map(); // vapiCallId -> checkoutId
+const CHECKOUTS_MAX = 500;
+
+// CheckoutRecord status values:
+//   pending_call          - timer running, will call when it expires
+//   skipped_test_mode     - timer expired but phone not in ALLOWED_PHONES
+//   call_failed           - vapi rejected the call
+//   call_in_progress      - call dispatched, waiting for outcome
+//   call_no_answer        - rang out without pickup
+//   call_voicemail        - went to voicemail
+//   call_completed        - conversation happened
+//   completed_before_call - customer paid before timer fired (no call needed)
+//   recovered_after_call  - customer paid AFTER our call (success!)
+
+function trimCheckouts() {
+  if (checkouts.size <= CHECKOUTS_MAX) return;
+  const oldest = Array.from(checkouts.entries())
+    .sort((a, b) => a[1].abandonedAt - b[1].abandonedAt)[0];
+  if (oldest) {
+    if (oldest[1].vapiCallId) callIdToCheckout.delete(oldest[1].vapiCallId);
+    checkouts.delete(oldest[0]);
+  }
+}
+
+function addEvent(rec, kind, detail = '') {
+  rec.events.push({ time: Date.now(), kind, detail });
+  console.log(`[${rec.id.slice(-12)}] ${kind}${detail ? ' - ' + detail : ''}`);
+}
+
+function normalizePhone(p) {
+  if (!p) return null;
+  const cleaned = String(p).replace(/[^\d+]/g, '');
+  if (!cleaned.startsWith('+') && cleaned.length >= 10) return '+' + cleaned;
+  return cleaned;
+}
+
+function summarizeCart(checkout) {
+  const items = (checkout.line_items || [])
+    .map(i => ({ qty: i.quantity, title: i.title })) || [];
+  const itemsText = items.map(i => `${i.qty}x ${i.title}`).join(', ') || 'items';
+  const total = parseFloat(checkout.total_price || checkout.subtotal_price || '0');
+  const currency = checkout.currency || 'USD';
+  return { items, itemsText, total, currency };
+}
+
+// --- Webhook signature verification (Shopify) ---
+app.use('/webhooks/checkouts', express.raw({ type: 'application/json' }));
+app.use('/webhooks/orders', express.raw({ type: 'application/json' }));
+
+function verifyShopify(req) {
+  const hmac = req.get('X-Shopify-Hmac-Sha256');
+  if (!hmac || !SHOPIFY_API_SECRET) return false;
+  const computed = crypto.createHmac('sha256', SHOPIFY_API_SECRET).update(req.body).digest('base64');
+  try { return crypto.timingSafeEqual(Buffer.from(hmac), Buffer.from(computed)); }
+  catch { return false; }
+}
+
+const parseBody = req => JSON.parse(req.body.toString('utf8'));
+
+// --- Shopify: checkout created/updated ---
+app.post('/webhooks/checkouts', (req, res) => {
+  if (!verifyShopify(req)) return res.status(401).send('bad signature');
+  res.status(200).send('ok');
+
+  const checkout = parseBody(req);
+  const id = String(checkout.id || checkout.token);
+  const phone = normalizePhone(
+    checkout.phone ||
+    checkout.customer?.phone ||
+    checkout.shipping_address?.phone ||
+    checkout.billing_address?.phone
+  );
+
+  if (!phone) {
+    console.log(`[${id.slice(-12)}] no phone yet, skipping`);
+    return;
+  }
+
+  let rec = checkouts.get(id);
+  const cart = summarizeCart(checkout);
+
+  if (!rec) {
+    rec = {
+      id,
+      abandonedAt: Date.now(),
+      customer: {
+        name: [checkout.customer?.first_name, checkout.customer?.last_name].filter(Boolean).join(' ') || 'Customer',
+        email: checkout.email || checkout.customer?.email || '',
+        phone,
+      },
+      cart,
+      recoveryUrl: checkout.abandoned_checkout_url || '',
+      status: 'pending_call',
+      events: [],
+      timer: null,
+      scheduledFor: null,
+      vapiCallId: null,
+      callOutcome: null,
+      callDuration: null,
+      transcript: '',
+      summary: '',
+      recordingUrl: '',
+      endReason: '',
+      orderId: null,
+      orderCompletedAt: null,
+      orderTotal: null,
+    };
+    checkouts.set(id, rec);
+    trimCheckouts();
+    addEvent(rec, 'abandoned', `${cart.itemsText} - ${cart.total} ${cart.currency}`);
+  } else {
+    // Existing record - update cart info (customer may have changed it)
+    rec.cart = cart;
+    rec.customer.phone = phone;
+  }
+
+  // Don't reschedule once call has been made or order completed
+  if (rec.status !== 'pending_call' && rec.status !== 'skipped_test_mode') return;
+
+  // Reset timer on every update — this is the "inactivity" reset
+  if (rec.timer) clearTimeout(rec.timer);
+  rec.timer = setTimeout(() => triggerCall(rec), DELAY_MS);
+  rec.scheduledFor = Date.now() + DELAY_MS;
+  rec.status = 'pending_call';
+  addEvent(rec, 'scheduled', `call in ${DELAY_MIN}min`);
+});
+
+// --- Shopify: order completed ---
+app.post('/webhooks/orders', (req, res) => {
+  if (!verifyShopify(req)) return res.status(401).send('bad signature');
+  res.status(200).send('ok');
+
+  const order = parseBody(req);
+  const id = String(order.checkout_id || order.checkout_token || '');
+  if (!id) return;
+
+  const rec = checkouts.get(id);
+  if (!rec) {
+    console.log(`Order ${order.id} for unknown checkout ${id.slice(-12)}`);
+    return;
+  }
+
+  if (rec.timer) {
+    clearTimeout(rec.timer);
+    rec.timer = null;
+  }
+
+  rec.orderId = order.id;
+  rec.orderCompletedAt = Date.now();
+  rec.orderTotal = parseFloat(order.total_price || '0');
+
+  if (rec.vapiCallId) {
+    rec.status = 'recovered_after_call';
+    addEvent(rec, 'recovered', `order ${order.id} - ${rec.orderTotal} ${order.currency} after call`);
+  } else {
+    rec.status = 'completed_before_call';
+    addEvent(rec, 'completed_before_call', `order ${order.id}`);
+  }
+});
+
+// --- Vapi call dispatch ---
+async function triggerCall(rec) {
+  rec.timer = null;
+  rec.scheduledFor = null;
+
+  if (MODE === 'test' && !ALLOWED_PHONES.includes(rec.customer.phone)) {
+    rec.status = 'skipped_test_mode';
+    addEvent(rec, 'skipped_test_mode', 'phone not in ALLOWED_PHONES');
+    return;
+  }
+
+  try {
+    const r = await fetch('https://api.vapi.ai/call', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${VAPI_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        assistantId: VAPI_ASSISTANT_ID,
+        phoneNumberId: VAPI_PHONE_NUMBER_ID,
+        customer: { number: rec.customer.phone },
+        assistantOverrides: {
+          variableValues: {
+            customerName: rec.customer.name.split(' ')[0] || 'there',
+            cartItems: rec.cart.itemsText,
+            cartTotal: `${rec.cart.total} ${rec.cart.currency}`,
+            recoveryUrl: rec.recoveryUrl,
+          },
+        },
+      }),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      rec.status = 'call_failed';
+      addEvent(rec, 'call_failed', JSON.stringify(data).slice(0, 200));
+      return;
+    }
+    rec.vapiCallId = data.id;
+    rec.status = 'call_in_progress';
+    callIdToCheckout.set(data.id, rec.id);
+    addEvent(rec, 'call_dispatched', data.id);
+  } catch (err) {
+    rec.status = 'call_failed';
+    addEvent(rec, 'call_failed', err.message);
+  }
+}
+
+// --- Vapi: call status updates and end-of-call reports ---
+app.post('/webhooks/vapi', express.json({ limit: '5mb' }), (req, res) => {
+  res.status(200).send('ok');
+
+  const msg = req.body?.message;
+  if (!msg) return;
+  const callId = msg.call?.id;
+  if (!callId) return;
+
+  const checkoutId = callIdToCheckout.get(callId);
+  if (!checkoutId) return;
+  const rec = checkouts.get(checkoutId);
+  if (!rec) return;
+
+  if (msg.type === 'status-update') {
+    addEvent(rec, 'call_status', msg.status || '');
+  } else if (msg.type === 'end-of-call-report') {
+    const endedReason = msg.endedReason || msg.call?.endedReason || '';
+    const startedAt = msg.startedAt || msg.call?.startedAt;
+    const endedAt = msg.endedAt || msg.call?.endedAt;
+    const duration = startedAt && endedAt
+      ? Math.round((new Date(endedAt) - new Date(startedAt)) / 1000)
+      : (msg.durationSeconds || 0);
+
+    rec.endReason = endedReason;
+    rec.callDuration = duration;
+    rec.transcript = msg.transcript || '';
+    rec.summary = msg.summary || msg.analysis?.summary || '';
+    rec.recordingUrl = msg.recordingUrl || msg.stereoRecordingUrl || '';
+    rec.messages = msg.messages || msg.artifact?.messages || [];
+
+    // Classify outcome
+    const reasonLower = endedReason.toLowerCase();
+    if (reasonLower.includes('voicemail')) {
+      rec.callOutcome = 'voicemail';
+      rec.status = 'call_voicemail';
+    } else if (reasonLower.includes('no-answer') || reasonLower.includes('did-not-answer') || reasonLower.includes('no_answer')) {
+      rec.callOutcome = 'no_answer';
+      rec.status = 'call_no_answer';
+    } else if (reasonLower.includes('busy')) {
+      rec.callOutcome = 'busy';
+      rec.status = 'call_no_answer';
+    } else if (duration > 5) {
+      // Real conversation happened
+      rec.callOutcome = 'answered';
+      // Only change status if not already recovered
+      if (rec.status !== 'recovered_after_call') rec.status = 'call_completed';
+    } else {
+      rec.callOutcome = endedReason || 'unknown';
+      if (rec.status !== 'recovered_after_call') rec.status = 'call_completed';
+    }
+
+    addEvent(rec, 'call_ended', `${rec.callOutcome} (${duration}s)`);
+  }
+});
+
+// --- Stats page ---
+function statsHandler(req, res) {
+  const today = new Date().toISOString().slice(0, 10);
+  const records = Array.from(checkouts.values())
+    .sort((a, b) => b.abandonedAt - a.abandonedAt);
+
+  const todayRecords = records.filter(r =>
+    new Date(r.abandonedAt).toISOString().slice(0, 10) === today
+  );
+
+  const c = {
+    abandoned: todayRecords.length,
+    called: todayRecords.filter(r => r.vapiCallId).length,
+    answered: todayRecords.filter(r => r.callOutcome === 'answered').length,
+    voicemail: todayRecords.filter(r => r.callOutcome === 'voicemail').length,
+    no_answer: todayRecords.filter(r => r.callOutcome === 'no_answer').length,
+    recovered: todayRecords.filter(r => r.status === 'recovered_after_call').length,
+    completed_no_call: todayRecords.filter(r => r.status === 'completed_before_call').length,
+    skipped: todayRecords.filter(r => r.status === 'skipped_test_mode').length,
+    failed: todayRecords.filter(r => r.status === 'call_failed').length,
+  };
+  c.recovery_rate = c.called > 0 ? Math.round((c.recovered / c.called) * 100) : 0;
+  c.revenue_recovered = todayRecords
+    .filter(r => r.status === 'recovered_after_call')
+    .reduce((sum, r) => sum + (r.orderTotal || r.cart.total || 0), 0);
+
+  res.send(renderStats(c, records));
+}
+
+if (STATS_SECRET) app.get(`/stats/${STATS_SECRET}`, statsHandler);
+else app.get('/stats', statsHandler);
+
+// --- HTML rendering ---
+const esc = s => String(s ?? '').replace(/[<>&"]/g, m =>
+  ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[m]));
+
+const STATUS_LABEL = {
+  pending_call: { text: 'Waiting', cls: 'pending' },
+  skipped_test_mode: { text: 'Skipped (test)', cls: 'muted' },
+  call_failed: { text: 'Call failed', cls: 'err' },
+  call_in_progress: { text: 'Calling now', cls: 'pending' },
+  call_no_answer: { text: 'No answer', cls: 'warn' },
+  call_voicemail: { text: 'Voicemail', cls: 'warn' },
+  call_completed: { text: 'Conversation', cls: 'ok' },
+  completed_before_call: { text: 'Bought (no call)', cls: 'ok' },
+  recovered_after_call: { text: 'RECOVERED', cls: 'win' },
+};
+
+function fmtTime(ts) {
+  return new Date(ts).toISOString().slice(11, 19) + ' UTC';
+}
+
+function fmtRelTime(ts) {
+  const s = Math.round((Date.now() - ts) / 1000);
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.round(s / 60)}m ago`;
+  if (s < 86400) return `${Math.round(s / 3600)}h ago`;
+  return `${Math.round(s / 86400)}d ago`;
+}
+
+function renderTranscript(rec) {
+  if (rec.messages && rec.messages.length) {
+    return rec.messages
+      .filter(m => m.role && (m.role === 'bot' || m.role === 'user' || m.role === 'assistant'))
+      .map(m => {
+        const speaker = (m.role === 'bot' || m.role === 'assistant') ? 'AI' : 'Customer';
+        const text = esc(m.message || m.content || '').trim();
+        if (!text) return '';
+        return `<div class="msg msg-${speaker.toLowerCase()}"><strong>${speaker}:</strong> ${text}</div>`;
+      }).filter(Boolean).join('');
+  }
+  if (rec.transcript) {
+    return `<pre class="raw-transcript">${esc(rec.transcript)}</pre>`;
+  }
+  return '<p class="muted">No transcript yet.</p>';
+}
+
+function renderRow(rec) {
+  const label = STATUS_LABEL[rec.status] || { text: rec.status, cls: '' };
+  const timeLeft = rec.scheduledFor
+    ? Math.max(0, Math.round((rec.scheduledFor - Date.now()) / 1000))
+    : null;
+  const statusExtra = rec.status === 'pending_call' && timeLeft !== null
+    ? ` (${timeLeft}s)`
+    : (rec.callDuration ? ` (${rec.callDuration}s)` : '');
+
+  const summary = `
+    <td class="time">${fmtRelTime(rec.abandonedAt)}</td>
+    <td>${esc(rec.customer.name)}<br><span class="k">${esc(rec.customer.phone)}</span></td>
+    <td>${esc(rec.cart.itemsText)}<br><span class="muted">${rec.cart.total} ${rec.cart.currency}</span></td>
+    <td><span class="badge ${label.cls}">${label.text}${statusExtra}</span>${rec.orderTotal ? `<br><span class="muted">order: ${rec.orderTotal}</span>` : ''}</td>
+  `;
+
+  const events = rec.events.map(e =>
+    `<div class="event"><span class="k">${fmtTime(e.time)}</span> <strong>${esc(e.kind)}</strong> ${esc(e.detail)}</div>`
+  ).join('');
+
+  const hasCall = rec.vapiCallId || rec.transcript || (rec.messages && rec.messages.length);
+
+  return `
+    <tr class="row-main">
+      ${summary}
+      <td><a href="#" onclick="this.closest('tr').nextElementSibling.classList.toggle('open');return false">details</a></td>
+    </tr>
+    <tr class="row-detail"><td colspan="5"><div class="detail-box">
+      <div class="dgrid">
+        <div><strong>Abandoned</strong><br>${new Date(rec.abandonedAt).toISOString().replace('T',' ').slice(0,19)} UTC</div>
+        <div><strong>Email</strong><br>${esc(rec.customer.email) || '<span class="muted">(none)</span>'}</div>
+        ${rec.recoveryUrl ? `<div><strong>Recovery link</strong><br><a href="${esc(rec.recoveryUrl)}" target="_blank">checkout url</a></div>` : ''}
+        ${rec.vapiCallId ? `<div><strong>Vapi call ID</strong><br><span class="k">${esc(rec.vapiCallId)}</span></div>` : ''}
+        ${rec.callDuration ? `<div><strong>Duration</strong><br>${rec.callDuration}s</div>` : ''}
+        ${rec.endReason ? `<div><strong>Ended because</strong><br>${esc(rec.endReason)}</div>` : ''}
+        ${rec.recordingUrl ? `<div><strong>Recording</strong><br><a href="${esc(rec.recordingUrl)}" target="_blank">listen</a></div>` : ''}
+        ${rec.orderId ? `<div><strong>Order</strong><br>#${esc(rec.orderId)} - ${rec.orderTotal} ${rec.cart.currency}</div>` : ''}
+      </div>
+      ${rec.summary ? `<div class="ai-summary"><strong>Call summary:</strong> ${esc(rec.summary)}</div>` : ''}
+      ${hasCall ? `<div class="transcript-box"><strong>Transcript:</strong>${renderTranscript(rec)}</div>` : ''}
+      <details class="event-log"><summary>Event log (${rec.events.length})</summary>${events}</details>
+    </div></td></tr>
+  `;
+}
+
+function renderStats(c, records) {
+  const modeLabel = MODE === 'live' ? 'LIVE - calling everyone' : 'TEST - only calling allowed phones';
+  const modeClass = MODE === 'live' ? 'live' : 'test';
+  const allowedDisplay = ALLOWED_PHONES.length
+    ? ALLOWED_PHONES.map(esc).join(', ')
+    : '<em>none set - no calls will go out</em>';
+
+  return `<!doctype html>
+<html><head><meta charset="utf-8"><title>Cartback stats</title>
+<meta http-equiv="refresh" content="15">
+<style>
+  body { font: 14px/1.5 -apple-system, system-ui, sans-serif; max-width: 1200px; margin: 1.5rem auto; padding: 0 1rem; color: #222; }
+  h1 { font-size: 20px; margin: 0 0 .5rem; }
+  h2 { font-size: 15px; margin: 1.5rem 0 .5rem; color: #555; font-weight: 500; }
+  .mode { padding: .6rem .8rem; border-radius: 6px; margin-bottom: 1rem; font-weight: 500; }
+  .mode.test { background: #fdf3d8; color: #6a5300; }
+  .mode.live { background: #fde0e0; color: #8a1f1f; }
+  .mode small { font-weight: 400; display: block; margin-top: .25rem; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: .5rem; margin-bottom: 1rem; }
+  .stat { background: #f5f5f3; padding: .55rem .7rem; border-radius: 6px; }
+  .stat .n { font-size: 20px; font-weight: 500; line-height: 1.1; }
+  .stat .l { font-size: 11px; color: #666; margin-top: .15rem; }
+  .stat.hero { background: #e8f4ea; }
+  .stat.hero .n { color: #0a7a3a; }
+  .ok { color: #0a7a3a; } .warn { color: #8a6d00; } .err { color: #b03030; } .win { color: #0a7a3a; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: .45rem .5rem; border-bottom: 1px solid #eee; vertical-align: top; }
+  th { color: #666; font-weight: 500; }
+  td.time { color: #888; white-space: nowrap; }
+  .k { font-family: ui-monospace, monospace; font-size: 12px; color: #666; }
+  .muted { color: #999; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; background: #eee; }
+  .badge.pending { background: #fef0c8; color: #8a6d00; }
+  .badge.ok { background: #d8efde; color: #0a7a3a; }
+  .badge.warn { background: #fde6c8; color: #8a4d00; }
+  .badge.err { background: #fbd8d8; color: #b03030; }
+  .badge.win { background: #0a7a3a; color: white; font-weight: 500; }
+  .badge.muted { background: #eee; color: #888; }
+  .row-detail { display: none; }
+  .row-detail.open { display: table-row; }
+  .row-detail td { background: #fafaf8; padding: 0; }
+  .detail-box { padding: .8rem 1rem; }
+  .dgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: .6rem; font-size: 12px; margin-bottom: .8rem; }
+  .ai-summary { padding: .5rem .7rem; background: #eef4ff; border-radius: 4px; margin: .5rem 0; font-size: 13px; }
+  .transcript-box { background: white; padding: .6rem .8rem; border-radius: 4px; border: 1px solid #eee; margin: .5rem 0; max-height: 400px; overflow-y: auto; }
+  .msg { margin: .3rem 0; font-size: 13px; }
+  .msg-ai strong { color: #4a5fc7; }
+  .msg-customer strong { color: #8a4400; }
+  .raw-transcript { white-space: pre-wrap; font-size: 12px; color: #444; }
+  .event-log { margin-top: .5rem; font-size: 12px; color: #666; }
+  .event-log summary { cursor: pointer; color: #888; }
+  .event { padding: 2px 0; }
+  a { color: #2a5fc7; }
+</style></head><body>
+<h1>Cartback stats</h1>
+<div class="mode ${modeClass}">${modeLabel}<small>Allowed phones: ${allowedDisplay}</small></div>
+
+<h2>Today (UTC)</h2>
+<div class="stats">
+  <div class="stat"><div class="n">${c.abandoned}</div><div class="l">abandoned</div></div>
+  <div class="stat"><div class="n">${c.called}</div><div class="l">calls made</div></div>
+  <div class="stat"><div class="n">${c.answered}</div><div class="l">answered</div></div>
+  <div class="stat"><div class="n">${c.no_answer + c.voicemail}</div><div class="l">missed/voicemail</div></div>
+  <div class="stat hero"><div class="n">${c.recovered}</div><div class="l">RECOVERED</div></div>
+  <div class="stat hero"><div class="n">${c.recovery_rate}%</div><div class="l">recovery rate</div></div>
+  <div class="stat hero"><div class="n">${c.revenue_recovered.toFixed(0)}</div><div class="l">revenue recovered</div></div>
+  <div class="stat"><div class="n">${c.completed_no_call}</div><div class="l">paid before call</div></div>
+  <div class="stat"><div class="n">${c.skipped}</div><div class="l">skipped (test)</div></div>
+  <div class="stat"><div class="n">${c.failed}</div><div class="l">errors</div></div>
+</div>
+
+<h2>Abandoned checkouts (${records.length} total)</h2>
+${records.length === 0 ? '<p class="muted">No abandoned checkouts yet. Try one on your dev store.</p>' : `
+<table>
+  <tr><th>When</th><th>Customer</th><th>Cart</th><th>Outcome</th><th></th></tr>
+  ${records.slice(0, 100).map(renderRow).join('')}
+</table>`}
+
+<p class="muted" style="margin-top: 2rem; font-size: 12px;">Auto-refreshes every 15s. Click "details" on any row to see the transcript and event log. State is in-memory and resets on deploy.</p>
+</body></html>`;
+}
+
+app.get('/', (req, res) =>
+  res.send(`cartback up - mode=${MODE} - ${checkouts.size} tracked\nStats: ${STATS_SECRET ? '/stats/' + STATS_SECRET : '/stats'}`)
+);
+
+app.listen(PORT, () => {
+  console.log(`cartback listening on :${PORT} (mode=${MODE})`);
+  if (MODE === 'test') {
+    console.log(`allowed phones: ${ALLOWED_PHONES.length ? ALLOWED_PHONES.join(', ') : '(none)'}`);
+  } else {
+    console.log('WARNING: live mode - will call every abandoned checkout with a phone');
+  }
+  if (!STATS_SECRET) console.warn('WARNING: STATS_SECRET not set, /stats is publicly accessible');
+});
