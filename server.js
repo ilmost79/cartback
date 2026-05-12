@@ -518,7 +518,8 @@ app.get('/', (req, res) =>
   res.send(`cartback up - mode=${MODE} - ${checkouts.size} tracked\nStats: ${STATS_SECRET ? '/stats/' + STATS_SECRET : '/stats'}\nShopify API: ${SHOPIFY_STORE_DOMAIN && SHOPIFY_ADMIN_TOKEN ? 'connected' : 'NOT CONFIGURED'}`)
 );
 
-app.listen(PORT, () => {
+app.listen(PORT, () => {app.listen(PORT, () => {
+  
   console.log(`cartback listening on :${PORT} (mode=${MODE})`);
   if (MODE === 'test') {
     console.log(`allowed phones: ${ALLOWED_PHONES.length ? ALLOWED_PHONES.join(', ') : '(none)'}`);
