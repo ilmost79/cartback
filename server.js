@@ -1,6 +1,5 @@
 // Cartback — abandoned checkout recovery via Vapi
-// New: on timer fire, fetches latest checkout state from Shopify API
-// to get whatever phone the customer has typed in by then.
+// Includes OAuth callback handler for Dev Dashboard apps
 
 import express from 'express';
 import crypto from 'crypto';
@@ -10,8 +9,9 @@ const PORT = process.env.PORT || 3000;
 
 // --- Env vars ---
 const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET;
-const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN || '';  // e.g. mystore.myshopify.com
-const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN || '';    // shpat_... from custom app
+const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID || '';
+const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN || '';
+const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN || '';
 const VAPI_API_KEY = process.env.VAPI_API_KEY;
 const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID;
 const VAPI_PHONE_NUMBER_ID = process.env.VAPI_PHONE_NUMBER_ID;
@@ -67,11 +67,9 @@ function summarizeCart(checkout) {
   return { items, itemsText, total, currency };
 }
 
-// Fetch the LATEST checkout state from Shopify's API.
-// This is the magic — gets whatever the customer has typed, even if no webhook fired with it.
 async function fetchCheckoutFromShopify(token) {
   if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_ADMIN_TOKEN) {
-    console.warn('SHOPIFY_STORE_DOMAIN or SHOPIFY_ADMIN_TOKEN not set - cannot fetch latest checkout');
+    console.warn('Shopify API not configured');
     return null;
   }
   try {
@@ -91,7 +89,7 @@ async function fetchCheckoutFromShopify(token) {
   }
 }
 
-// Webhook verification (Shopify)
+// Webhook verification
 app.use('/webhooks/checkouts', express.raw({ type: 'application/json' }));
 app.use('/webhooks/orders', express.raw({ type: 'application/json' }));
 
@@ -105,9 +103,78 @@ function verifyShopify(req) {
 
 const parseBody = req => JSON.parse(req.body.toString('utf8'));
 
+// --- OAuth callback - exchanges code for access token ---
+app.get('/auth/callback', async (req, res) => {
+  const { code, shop } = req.query;
+  if (!code || !shop) {
+    return res.send('<h1>Missing parameters</h1><p>This page expects code and shop query parameters from Shopify OAuth.</p>');
+  }
+  if (!SHOPIFY_CLIENT_ID) {
+    return res.send('<h1>Setup needed</h1><p>Set SHOPIFY_CLIENT_ID env var in Render with your Dev Dashboard Client ID.</p>');
+  }
+  if (!SHOPIFY_API_SECRET) {
+    return res.send('<h1>Setup needed</h1><p>Set SHOPIFY_API_SECRET env var in Render with your Client Secret.</p>');
+  }
+  try {
+    const r = await fetch(`https://${shop}/admin/oauth/access_token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_id: SHOPIFY_CLIENT_ID,
+        client_secret: SHOPIFY_API_SECRET,
+        code,
+      }),
+    });
+    const data = await r.json();
+    if (!r.ok || !data.access_token) {
+      return res.send(`<h1>OAuth exchange failed</h1><pre>${JSON.stringify(data, null, 2)}</pre>`);
+    }
+    console.log(`OAuth complete for ${shop}. Token: ${data.access_token.slice(0, 20)}...`);
+    res.send(`
+      <html><body style="font-family: -apple-system, sans-serif; max-width: 700px; margin: 3rem auto; padding: 0 1rem;">
+        <h1>✅ Installation complete!</h1>
+        <p>Store: <code>${shop}</code></p>
+        <h2>Your Admin API Access Token:</h2>
+        <p style="background: #f5f5f3; padding: 1rem; border-radius: 6px; word-break: break-all; font-family: monospace; font-size: 14px;">${data.access_token}</p>
+        <p><strong>⚠️ Copy this token now — it won't be shown again.</strong></p>
+        <ol>
+          <li>Copy the token</li>
+          <li>Go to Render → cartback → Environment</li>
+          <li>Update <code>SHOPIFY_ADMIN_TOKEN</code> with this value</li>
+          <li>Save Changes</li>
+        </ol>
+      </body></html>
+    `);
+  } catch (err) {
+    res.status(500).send(`<h1>Error</h1><p>${err.message}</p>`);
+  }
+});
+
+// --- Manual test endpoint ---
+app.get('/test-call/:secret', (req, res) => {
+  if (!STATS_SECRET || req.params.secret !== STATS_SECRET) return res.status(404).send('not found');
+  const phone = ALLOWED_PHONES[0];
+  if (!phone) return res.send('No phone in ALLOWED_PHONES env var');
+  const id = 'test-' + Date.now();
+  const rec = {
+    id,
+    abandonedAt: Date.now(),
+    customer: { name: 'Test Customer', email: '', phone },
+    cart: { items: [], itemsText: '1x Test Tacoma Skid Plate', total: 149.99, currency: 'USD' },
+    recoveryUrl: '',
+    status: 'pending_call',
+    events: [],
+    timer: null,
+    scheduledFor: null,
+    vapiCallId: null,
+  };
+  checkouts.set(id, rec);
+  addEvent(rec, 'test_call_triggered', 'manual test');
+  triggerCall(rec);
+  res.send(`Test call dispatched to ${phone}. Phone should ring in 5-15 sec. Watch dashboard.`);
+});
+
 // --- Shopify checkout webhook ---
-// We ALWAYS create/update a record, even without a phone.
-// We ALWAYS schedule the timer. Phone gets resolved when the timer fires.
 app.post('/webhooks/checkouts', (req, res) => {
   if (!verifyShopify(req)) return res.status(401).send('bad signature');
   res.status(200).send('ok');
@@ -150,7 +217,6 @@ app.post('/webhooks/checkouts', (req, res) => {
     trimCheckouts();
     addEvent(rec, 'abandoned', `${cart.itemsText} - ${cart.total} ${cart.currency}`);
   } else {
-    // Update existing record with newer data
     rec.cart = cart;
     if (phone) rec.customer.phone = phone;
     if (checkout.customer?.first_name) {
@@ -159,10 +225,8 @@ app.post('/webhooks/checkouts', (req, res) => {
     if (checkout.email) rec.customer.email = checkout.email;
   }
 
-  // Don't reschedule once call has been made or order completed
   if (rec.status !== 'pending_call' && rec.status !== 'abandoned_no_phone' && rec.status !== 'skipped_test_mode') return;
 
-  // Reset the inactivity timer on every webhook update
   if (rec.timer) clearTimeout(rec.timer);
   rec.timer = setTimeout(() => triggerCall(rec), DELAY_MS);
   rec.scheduledFor = Date.now() + DELAY_MS;
@@ -170,7 +234,6 @@ app.post('/webhooks/checkouts', (req, res) => {
   addEvent(rec, 'scheduled', `timer reset, fires in ${DELAY_MIN}min${phone ? ' (phone known)' : ' (phone TBD)'}`);
 });
 
-// --- Order completed webhook ---
 app.post('/webhooks/orders', (req, res) => {
   if (!verifyShopify(req)) return res.status(401).send('bad signature');
   res.status(200).send('ok');
@@ -199,12 +262,10 @@ app.post('/webhooks/orders', (req, res) => {
   }
 });
 
-// --- Timer fires: figure out phone & decide what to do ---
 async function triggerCall(rec) {
   rec.timer = null;
   rec.scheduledFor = null;
 
-  // If we don't have phone in our cached record, ask Shopify for the latest state
   if (!rec.customer.phone) {
     addEvent(rec, 'fetching_latest', 'no phone in cache, asking Shopify API');
     const latest = await fetchCheckoutFromShopify(rec.id);
@@ -212,7 +273,6 @@ async function triggerCall(rec) {
       const apiPhone = extractPhone(latest);
       if (apiPhone) {
         rec.customer.phone = apiPhone;
-        // Also update other fields while we're at it
         if (latest.customer?.first_name) {
           rec.customer.name = [latest.customer.first_name, latest.customer.last_name].filter(Boolean).join(' ');
         }
@@ -220,26 +280,23 @@ async function triggerCall(rec) {
         rec.cart = summarizeCart(latest);
         addEvent(rec, 'phone_found_via_api', apiPhone);
       } else {
-        addEvent(rec, 'api_no_phone', 'Shopify API also has no phone for this checkout');
+        addEvent(rec, 'api_no_phone', 'Shopify API also has no phone');
       }
     }
   }
 
-  // Still no phone? Mark as abandoned and stop.
   if (!rec.customer.phone) {
     rec.status = 'abandoned_no_phone';
-    addEvent(rec, 'abandoned_no_phone', 'no phone available - cannot call');
+    addEvent(rec, 'abandoned_no_phone', 'no phone available');
     return;
   }
 
-  // Safety: in test mode, only call allowed phones
   if (MODE === 'test' && !ALLOWED_PHONES.includes(rec.customer.phone)) {
     rec.status = 'skipped_test_mode';
     addEvent(rec, 'skipped_test_mode', `phone ${rec.customer.phone} not in ALLOWED_PHONES`);
     return;
   }
 
-  // Make the call
   try {
     const r = await fetch('https://api.vapi.ai/call', {
       method: 'POST',
@@ -274,7 +331,7 @@ async function triggerCall(rec) {
   }
 }
 
-// --- Vapi webhook (call status updates and end-of-call reports) ---
+// Vapi webhook
 app.post('/webhooks/vapi', express.json({ limit: '5mb' }), (req, res) => {
   res.status(200).send('ok');
   const msg = req.body?.message;
@@ -321,7 +378,7 @@ app.post('/webhooks/vapi', express.json({ limit: '5mb' }), (req, res) => {
   }
 });
 
-// --- Stats page ---
+// Stats page
 function statsHandler(req, res) {
   const today = new Date().toISOString().slice(0, 10);
   const records = Array.from(checkouts.values()).sort((a, b) => b.abandonedAt - a.abandonedAt);
@@ -436,7 +493,7 @@ function renderStats(c, records) {
     : '<em>none set - no calls will go out</em>';
   const apiStatus = (SHOPIFY_STORE_DOMAIN && SHOPIFY_ADMIN_TOKEN)
     ? `<span class="ok">connected</span>`
-    : `<span class="err">NOT CONFIGURED - phone will not be fetched on timer</span>`;
+    : `<span class="err">NOT CONFIGURED</span>`;
 
   return `<!doctype html>
 <html><head><meta charset="utf-8"><title>Cartback stats</title>
@@ -488,7 +545,7 @@ function renderStats(c, records) {
 </style></head><body>
 <h1>Cartback stats</h1>
 <div class="mode ${modeClass}">${modeLabel}<small>Allowed phones: ${allowedDisplay}</small></div>
-<div class="api">Shopify API fetch: ${apiStatus}</div>
+<div class="api">Shopify API: ${apiStatus}</div>
 
 <h2>Today (UTC)</h2>
 <div class="stats">
@@ -510,7 +567,7 @@ ${records.length === 0 ? '<p class="muted">No abandoned checkouts yet.</p>' : `
 <table><tr><th>When</th><th>Customer</th><th>Cart</th><th>Outcome</th><th></th></tr>
 ${records.slice(0, 100).map(renderRow).join('')}</table>`}
 
-<p class="muted" style="margin-top: 2rem; font-size: 12px;">Auto-refresh every 15s. Click "details" on any row to see transcript and event log. State is in-memory and resets on deploy.</p>
+<p class="muted" style="margin-top: 2rem; font-size: 12px;">Auto-refresh every 15s. State is in-memory and resets on deploy.</p>
 </body></html>`;
 }
 
@@ -518,16 +575,12 @@ app.get('/', (req, res) =>
   res.send(`cartback up - mode=${MODE} - ${checkouts.size} tracked\nStats: ${STATS_SECRET ? '/stats/' + STATS_SECRET : '/stats'}\nShopify API: ${SHOPIFY_STORE_DOMAIN && SHOPIFY_ADMIN_TOKEN ? 'connected' : 'NOT CONFIGURED'}`)
 );
 
-app.listen(PORT, () => {app.listen(PORT, () => {
-  
+app.listen(PORT, () => {
   console.log(`cartback listening on :${PORT} (mode=${MODE})`);
   if (MODE === 'test') {
     console.log(`allowed phones: ${ALLOWED_PHONES.length ? ALLOWED_PHONES.join(', ') : '(none)'}`);
   }
-  if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_ADMIN_TOKEN) {
-    console.warn('SHOPIFY_STORE_DOMAIN or SHOPIFY_ADMIN_TOKEN not set - cannot fetch latest checkout state on timer');
-  } else {
-    console.log(`Shopify API: ${SHOPIFY_STORE_DOMAIN}`);
-  }
+  console.log(`Shopify API: ${SHOPIFY_STORE_DOMAIN && SHOPIFY_ADMIN_TOKEN ? 'connected to ' + SHOPIFY_STORE_DOMAIN : 'NOT configured'}`);
+  console.log(`OAuth callback: ${SHOPIFY_CLIENT_ID && SHOPIFY_API_SECRET ? 'ready' : 'NOT ready (set SHOPIFY_CLIENT_ID)'}`);
   if (!STATS_SECRET) console.warn('WARNING: STATS_SECRET not set');
 });
