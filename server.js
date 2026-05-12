@@ -1,5 +1,6 @@
-// Cartback — abandoned checkout recovery via Vapi, with full lifecycle tracking
-// Tracks each abandoned checkout through: scheduled → called → answered/missed → recovered
+// Cartback — abandoned checkout recovery via Vapi
+// New: on timer fire, fetches latest checkout state from Shopify API
+// to get whatever phone the customer has typed in by then.
 
 import express from 'express';
 import crypto from 'crypto';
@@ -7,8 +8,10 @@ import crypto from 'crypto';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// --- Env vars (see .env.example) ---
+// --- Env vars ---
 const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET;
+const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN || '';  // e.g. mystore.myshopify.com
+const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN || '';    // shpat_... from custom app
 const VAPI_API_KEY = process.env.VAPI_API_KEY;
 const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID;
 const VAPI_PHONE_NUMBER_ID = process.env.VAPI_PHONE_NUMBER_ID;
@@ -19,22 +22,10 @@ const ALLOWED_PHONES = (process.env.ALLOWED_PHONES || '')
   .split(',').map(p => p.trim()).filter(Boolean);
 const STATS_SECRET = process.env.STATS_SECRET || '';
 
-// --- State (in-memory, resets on restart) ---
-// Each abandoned checkout is one record with its full lifecycle.
-const checkouts = new Map();        // checkoutId -> CheckoutRecord
-const callIdToCheckout = new Map(); // vapiCallId -> checkoutId
+// --- State ---
+const checkouts = new Map();
+const callIdToCheckout = new Map();
 const CHECKOUTS_MAX = 500;
-
-// CheckoutRecord status values:
-//   pending_call          - timer running, will call when it expires
-//   skipped_test_mode     - timer expired but phone not in ALLOWED_PHONES
-//   call_failed           - vapi rejected the call
-//   call_in_progress      - call dispatched, waiting for outcome
-//   call_no_answer        - rang out without pickup
-//   call_voicemail        - went to voicemail
-//   call_completed        - conversation happened
-//   completed_before_call - customer paid before timer fired (no call needed)
-//   recovered_after_call  - customer paid AFTER our call (success!)
 
 function trimCheckouts() {
   if (checkouts.size <= CHECKOUTS_MAX) return;
@@ -55,19 +46,52 @@ function normalizePhone(p) {
   if (!p) return null;
   const cleaned = String(p).replace(/[^\d+]/g, '');
   if (!cleaned.startsWith('+') && cleaned.length >= 10) return '+' + cleaned;
-  return cleaned;
+  return cleaned || null;
+}
+
+function extractPhone(checkout) {
+  return normalizePhone(
+    checkout.phone ||
+    checkout.customer?.phone ||
+    checkout.shipping_address?.phone ||
+    checkout.billing_address?.phone ||
+    checkout.customer?.default_address?.phone
+  );
 }
 
 function summarizeCart(checkout) {
-  const items = (checkout.line_items || [])
-    .map(i => ({ qty: i.quantity, title: i.title })) || [];
+  const items = (checkout.line_items || []).map(i => ({ qty: i.quantity, title: i.title })) || [];
   const itemsText = items.map(i => `${i.qty}x ${i.title}`).join(', ') || 'items';
   const total = parseFloat(checkout.total_price || checkout.subtotal_price || '0');
   const currency = checkout.currency || 'USD';
   return { items, itemsText, total, currency };
 }
 
-// --- Webhook signature verification (Shopify) ---
+// Fetch the LATEST checkout state from Shopify's API.
+// This is the magic — gets whatever the customer has typed, even if no webhook fired with it.
+async function fetchCheckoutFromShopify(token) {
+  if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_ADMIN_TOKEN) {
+    console.warn('SHOPIFY_STORE_DOMAIN or SHOPIFY_ADMIN_TOKEN not set - cannot fetch latest checkout');
+    return null;
+  }
+  try {
+    const url = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/2025-01/checkouts/${token}.json`;
+    const r = await fetch(url, {
+      headers: { 'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN },
+    });
+    if (!r.ok) {
+      console.warn(`Shopify API ${r.status} for checkout ${token.slice(-12)}`);
+      return null;
+    }
+    const data = await r.json();
+    return data.checkout || null;
+  } catch (err) {
+    console.warn(`Shopify API fetch failed: ${err.message}`);
+    return null;
+  }
+}
+
+// Webhook verification (Shopify)
 app.use('/webhooks/checkouts', express.raw({ type: 'application/json' }));
 app.use('/webhooks/orders', express.raw({ type: 'application/json' }));
 
@@ -81,36 +105,29 @@ function verifyShopify(req) {
 
 const parseBody = req => JSON.parse(req.body.toString('utf8'));
 
-// --- Shopify: checkout created/updated ---
+// --- Shopify checkout webhook ---
+// We ALWAYS create/update a record, even without a phone.
+// We ALWAYS schedule the timer. Phone gets resolved when the timer fires.
 app.post('/webhooks/checkouts', (req, res) => {
   if (!verifyShopify(req)) return res.status(401).send('bad signature');
   res.status(200).send('ok');
 
   const checkout = parseBody(req);
-  const id = String(checkout.id || checkout.token);
-  const phone = normalizePhone(
-    checkout.phone ||
-    checkout.customer?.phone ||
-    checkout.shipping_address?.phone ||
-    checkout.billing_address?.phone
-  );
+  const token = String(checkout.token || checkout.id || '');
+  if (!token) return;
 
-  if (!phone) {
-    console.log(`[${id.slice(-12)}] no phone yet, skipping`);
-    return;
-  }
-
-  let rec = checkouts.get(id);
+  const phone = extractPhone(checkout);
   const cart = summarizeCart(checkout);
+  let rec = checkouts.get(token);
 
   if (!rec) {
     rec = {
-      id,
+      id: token,
       abandonedAt: Date.now(),
       customer: {
         name: [checkout.customer?.first_name, checkout.customer?.last_name].filter(Boolean).join(' ') || 'Customer',
         email: checkout.email || checkout.customer?.email || '',
-        phone,
+        phone: phone || null,
       },
       cart,
       recoveryUrl: checkout.abandoned_checkout_url || '',
@@ -129,77 +146,104 @@ app.post('/webhooks/checkouts', (req, res) => {
       orderCompletedAt: null,
       orderTotal: null,
     };
-    checkouts.set(id, rec);
+    checkouts.set(token, rec);
     trimCheckouts();
     addEvent(rec, 'abandoned', `${cart.itemsText} - ${cart.total} ${cart.currency}`);
   } else {
-    // Existing record - update cart info (customer may have changed it)
+    // Update existing record with newer data
     rec.cart = cart;
-    rec.customer.phone = phone;
+    if (phone) rec.customer.phone = phone;
+    if (checkout.customer?.first_name) {
+      rec.customer.name = [checkout.customer.first_name, checkout.customer.last_name].filter(Boolean).join(' ');
+    }
+    if (checkout.email) rec.customer.email = checkout.email;
   }
 
   // Don't reschedule once call has been made or order completed
-  if (rec.status !== 'pending_call' && rec.status !== 'skipped_test_mode') return;
+  if (rec.status !== 'pending_call' && rec.status !== 'abandoned_no_phone' && rec.status !== 'skipped_test_mode') return;
 
-  // Reset timer on every update — this is the "inactivity" reset
+  // Reset the inactivity timer on every webhook update
   if (rec.timer) clearTimeout(rec.timer);
   rec.timer = setTimeout(() => triggerCall(rec), DELAY_MS);
   rec.scheduledFor = Date.now() + DELAY_MS;
   rec.status = 'pending_call';
-  addEvent(rec, 'scheduled', `call in ${DELAY_MIN}min`);
+  addEvent(rec, 'scheduled', `timer reset, fires in ${DELAY_MIN}min${phone ? ' (phone known)' : ' (phone TBD)'}`);
 });
 
-// --- Shopify: order completed ---
+// --- Order completed webhook ---
 app.post('/webhooks/orders', (req, res) => {
   if (!verifyShopify(req)) return res.status(401).send('bad signature');
   res.status(200).send('ok');
 
   const order = parseBody(req);
-  const id = String(order.checkout_id || order.checkout_token || '');
-  if (!id) return;
+  const token = String(order.checkout_token || order.checkout_id || '');
+  if (!token) return;
 
-  const rec = checkouts.get(id);
-  if (!rec) {
-    console.log(`Order ${order.id} for unknown checkout ${id.slice(-12)}`);
-    return;
-  }
+  const rec = checkouts.get(token);
+  if (!rec) return;
 
   if (rec.timer) {
     clearTimeout(rec.timer);
     rec.timer = null;
   }
-
   rec.orderId = order.id;
   rec.orderCompletedAt = Date.now();
   rec.orderTotal = parseFloat(order.total_price || '0');
 
   if (rec.vapiCallId) {
     rec.status = 'recovered_after_call';
-    addEvent(rec, 'recovered', `order ${order.id} - ${rec.orderTotal} ${order.currency} after call`);
+    addEvent(rec, 'recovered', `order ${order.id} after call`);
   } else {
     rec.status = 'completed_before_call';
     addEvent(rec, 'completed_before_call', `order ${order.id}`);
   }
 });
 
-// --- Vapi call dispatch ---
+// --- Timer fires: figure out phone & decide what to do ---
 async function triggerCall(rec) {
   rec.timer = null;
   rec.scheduledFor = null;
 
-  if (MODE === 'test' && !ALLOWED_PHONES.includes(rec.customer.phone)) {
-    rec.status = 'skipped_test_mode';
-    addEvent(rec, 'skipped_test_mode', 'phone not in ALLOWED_PHONES');
+  // If we don't have phone in our cached record, ask Shopify for the latest state
+  if (!rec.customer.phone) {
+    addEvent(rec, 'fetching_latest', 'no phone in cache, asking Shopify API');
+    const latest = await fetchCheckoutFromShopify(rec.id);
+    if (latest) {
+      const apiPhone = extractPhone(latest);
+      if (apiPhone) {
+        rec.customer.phone = apiPhone;
+        // Also update other fields while we're at it
+        if (latest.customer?.first_name) {
+          rec.customer.name = [latest.customer.first_name, latest.customer.last_name].filter(Boolean).join(' ');
+        }
+        if (latest.email) rec.customer.email = latest.email;
+        rec.cart = summarizeCart(latest);
+        addEvent(rec, 'phone_found_via_api', apiPhone);
+      } else {
+        addEvent(rec, 'api_no_phone', 'Shopify API also has no phone for this checkout');
+      }
+    }
+  }
+
+  // Still no phone? Mark as abandoned and stop.
+  if (!rec.customer.phone) {
+    rec.status = 'abandoned_no_phone';
+    addEvent(rec, 'abandoned_no_phone', 'no phone available - cannot call');
     return;
   }
 
+  // Safety: in test mode, only call allowed phones
+  if (MODE === 'test' && !ALLOWED_PHONES.includes(rec.customer.phone)) {
+    rec.status = 'skipped_test_mode';
+    addEvent(rec, 'skipped_test_mode', `phone ${rec.customer.phone} not in ALLOWED_PHONES`);
+    return;
+  }
+
+  // Make the call
   try {
     const r = await fetch('https://api.vapi.ai/call', {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${VAPI_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
+      headers: { Authorization: `Bearer ${VAPI_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         assistantId: VAPI_ASSISTANT_ID,
         phoneNumberId: VAPI_PHONE_NUMBER_ID,
@@ -230,15 +274,13 @@ async function triggerCall(rec) {
   }
 }
 
-// --- Vapi: call status updates and end-of-call reports ---
+// --- Vapi webhook (call status updates and end-of-call reports) ---
 app.post('/webhooks/vapi', express.json({ limit: '5mb' }), (req, res) => {
   res.status(200).send('ok');
-
   const msg = req.body?.message;
   if (!msg) return;
   const callId = msg.call?.id;
   if (!callId) return;
-
   const checkoutId = callIdToCheckout.get(callId);
   if (!checkoutId) return;
   const rec = checkouts.get(checkoutId);
@@ -261,27 +303,20 @@ app.post('/webhooks/vapi', express.json({ limit: '5mb' }), (req, res) => {
     rec.recordingUrl = msg.recordingUrl || msg.stereoRecordingUrl || '';
     rec.messages = msg.messages || msg.artifact?.messages || [];
 
-    // Classify outcome
     const reasonLower = endedReason.toLowerCase();
     if (reasonLower.includes('voicemail')) {
-      rec.callOutcome = 'voicemail';
-      rec.status = 'call_voicemail';
+      rec.callOutcome = 'voicemail'; rec.status = 'call_voicemail';
     } else if (reasonLower.includes('no-answer') || reasonLower.includes('did-not-answer') || reasonLower.includes('no_answer')) {
-      rec.callOutcome = 'no_answer';
-      rec.status = 'call_no_answer';
+      rec.callOutcome = 'no_answer'; rec.status = 'call_no_answer';
     } else if (reasonLower.includes('busy')) {
-      rec.callOutcome = 'busy';
-      rec.status = 'call_no_answer';
+      rec.callOutcome = 'busy'; rec.status = 'call_no_answer';
     } else if (duration > 5) {
-      // Real conversation happened
       rec.callOutcome = 'answered';
-      // Only change status if not already recovered
       if (rec.status !== 'recovered_after_call') rec.status = 'call_completed';
     } else {
       rec.callOutcome = endedReason || 'unknown';
       if (rec.status !== 'recovered_after_call') rec.status = 'call_completed';
     }
-
     addEvent(rec, 'call_ended', `${rec.callOutcome} (${duration}s)`);
   }
 });
@@ -289,9 +324,7 @@ app.post('/webhooks/vapi', express.json({ limit: '5mb' }), (req, res) => {
 // --- Stats page ---
 function statsHandler(req, res) {
   const today = new Date().toISOString().slice(0, 10);
-  const records = Array.from(checkouts.values())
-    .sort((a, b) => b.abandonedAt - a.abandonedAt);
-
+  const records = Array.from(checkouts.values()).sort((a, b) => b.abandonedAt - a.abandonedAt);
   const todayRecords = records.filter(r =>
     new Date(r.abandonedAt).toISOString().slice(0, 10) === today
   );
@@ -305,6 +338,7 @@ function statsHandler(req, res) {
     recovered: todayRecords.filter(r => r.status === 'recovered_after_call').length,
     completed_no_call: todayRecords.filter(r => r.status === 'completed_before_call').length,
     skipped: todayRecords.filter(r => r.status === 'skipped_test_mode').length,
+    no_phone: todayRecords.filter(r => r.status === 'abandoned_no_phone').length,
     failed: todayRecords.filter(r => r.status === 'call_failed').length,
   };
   c.recovery_rate = c.called > 0 ? Math.round((c.recovered / c.called) * 100) : 0;
@@ -318,12 +352,12 @@ function statsHandler(req, res) {
 if (STATS_SECRET) app.get(`/stats/${STATS_SECRET}`, statsHandler);
 else app.get('/stats', statsHandler);
 
-// --- HTML rendering ---
 const esc = s => String(s ?? '').replace(/[<>&"]/g, m =>
   ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[m]));
 
 const STATUS_LABEL = {
   pending_call: { text: 'Waiting', cls: 'pending' },
+  abandoned_no_phone: { text: 'Abandoned, no phone', cls: 'muted' },
   skipped_test_mode: { text: 'Skipped (test)', cls: 'muted' },
   call_failed: { text: 'Call failed', cls: 'err' },
   call_in_progress: { text: 'Calling now', cls: 'pending' },
@@ -334,10 +368,7 @@ const STATUS_LABEL = {
   recovered_after_call: { text: 'RECOVERED', cls: 'win' },
 };
 
-function fmtTime(ts) {
-  return new Date(ts).toISOString().slice(11, 19) + ' UTC';
-}
-
+function fmtTime(ts) { return new Date(ts).toISOString().slice(11, 19) + ' UTC'; }
 function fmtRelTime(ts) {
   const s = Math.round((Date.now() - ts) / 1000);
   if (s < 60) return `${s}s ago`;
@@ -349,7 +380,7 @@ function fmtRelTime(ts) {
 function renderTranscript(rec) {
   if (rec.messages && rec.messages.length) {
     return rec.messages
-      .filter(m => m.role && (m.role === 'bot' || m.role === 'user' || m.role === 'assistant'))
+      .filter(m => m.role === 'bot' || m.role === 'user' || m.role === 'assistant')
       .map(m => {
         const speaker = (m.role === 'bot' || m.role === 'assistant') ? 'AI' : 'Customer';
         const text = esc(m.message || m.content || '').trim();
@@ -357,39 +388,29 @@ function renderTranscript(rec) {
         return `<div class="msg msg-${speaker.toLowerCase()}"><strong>${speaker}:</strong> ${text}</div>`;
       }).filter(Boolean).join('');
   }
-  if (rec.transcript) {
-    return `<pre class="raw-transcript">${esc(rec.transcript)}</pre>`;
-  }
-  return '<p class="muted">No transcript yet.</p>';
+  if (rec.transcript) return `<pre class="raw-transcript">${esc(rec.transcript)}</pre>`;
+  return '<p class="muted">No transcript.</p>';
 }
 
 function renderRow(rec) {
   const label = STATUS_LABEL[rec.status] || { text: rec.status, cls: '' };
-  const timeLeft = rec.scheduledFor
-    ? Math.max(0, Math.round((rec.scheduledFor - Date.now()) / 1000))
-    : null;
-  const statusExtra = rec.status === 'pending_call' && timeLeft !== null
-    ? ` (${timeLeft}s)`
+  const timeLeft = rec.scheduledFor ? Math.max(0, Math.round((rec.scheduledFor - Date.now()) / 1000)) : null;
+  const statusExtra = rec.status === 'pending_call' && timeLeft !== null ? ` (${timeLeft}s)`
     : (rec.callDuration ? ` (${rec.callDuration}s)` : '');
 
   const summary = `
     <td class="time">${fmtRelTime(rec.abandonedAt)}</td>
-    <td>${esc(rec.customer.name)}<br><span class="k">${esc(rec.customer.phone)}</span></td>
+    <td>${esc(rec.customer.name)}<br><span class="k">${esc(rec.customer.phone || '(no phone)')}</span></td>
     <td>${esc(rec.cart.itemsText)}<br><span class="muted">${rec.cart.total} ${rec.cart.currency}</span></td>
     <td><span class="badge ${label.cls}">${label.text}${statusExtra}</span>${rec.orderTotal ? `<br><span class="muted">order: ${rec.orderTotal}</span>` : ''}</td>
   `;
-
   const events = rec.events.map(e =>
     `<div class="event"><span class="k">${fmtTime(e.time)}</span> <strong>${esc(e.kind)}</strong> ${esc(e.detail)}</div>`
   ).join('');
-
   const hasCall = rec.vapiCallId || rec.transcript || (rec.messages && rec.messages.length);
 
   return `
-    <tr class="row-main">
-      ${summary}
-      <td><a href="#" onclick="this.closest('tr').nextElementSibling.classList.toggle('open');return false">details</a></td>
-    </tr>
+    <tr class="row-main">${summary}<td><a href="#" onclick="this.closest('tr').nextElementSibling.classList.toggle('open');return false">details</a></td></tr>
     <tr class="row-detail"><td colspan="5"><div class="detail-box">
       <div class="dgrid">
         <div><strong>Abandoned</strong><br>${new Date(rec.abandonedAt).toISOString().replace('T',' ').slice(0,19)} UTC</div>
@@ -404,8 +425,7 @@ function renderRow(rec) {
       ${rec.summary ? `<div class="ai-summary"><strong>Call summary:</strong> ${esc(rec.summary)}</div>` : ''}
       ${hasCall ? `<div class="transcript-box"><strong>Transcript:</strong>${renderTranscript(rec)}</div>` : ''}
       <details class="event-log"><summary>Event log (${rec.events.length})</summary>${events}</details>
-    </div></td></tr>
-  `;
+    </div></td></tr>`;
 }
 
 function renderStats(c, records) {
@@ -414,6 +434,9 @@ function renderStats(c, records) {
   const allowedDisplay = ALLOWED_PHONES.length
     ? ALLOWED_PHONES.map(esc).join(', ')
     : '<em>none set - no calls will go out</em>';
+  const apiStatus = (SHOPIFY_STORE_DOMAIN && SHOPIFY_ADMIN_TOKEN)
+    ? `<span class="ok">connected</span>`
+    : `<span class="err">NOT CONFIGURED - phone will not be fetched on timer</span>`;
 
   return `<!doctype html>
 <html><head><meta charset="utf-8"><title>Cartback stats</title>
@@ -422,10 +445,11 @@ function renderStats(c, records) {
   body { font: 14px/1.5 -apple-system, system-ui, sans-serif; max-width: 1200px; margin: 1.5rem auto; padding: 0 1rem; color: #222; }
   h1 { font-size: 20px; margin: 0 0 .5rem; }
   h2 { font-size: 15px; margin: 1.5rem 0 .5rem; color: #555; font-weight: 500; }
-  .mode { padding: .6rem .8rem; border-radius: 6px; margin-bottom: 1rem; font-weight: 500; }
+  .mode { padding: .6rem .8rem; border-radius: 6px; margin-bottom: .5rem; font-weight: 500; }
   .mode.test { background: #fdf3d8; color: #6a5300; }
   .mode.live { background: #fde0e0; color: #8a1f1f; }
   .mode small { font-weight: 400; display: block; margin-top: .25rem; }
+  .api { font-size: 12px; color: #888; margin-bottom: 1rem; }
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: .5rem; margin-bottom: 1rem; }
   .stat { background: #f5f5f3; padding: .55rem .7rem; border-radius: 6px; }
   .stat .n { font-size: 20px; font-weight: 500; line-height: 1.1; }
@@ -464,6 +488,7 @@ function renderStats(c, records) {
 </style></head><body>
 <h1>Cartback stats</h1>
 <div class="mode ${modeClass}">${modeLabel}<small>Allowed phones: ${allowedDisplay}</small></div>
+<div class="api">Shopify API fetch: ${apiStatus}</div>
 
 <h2>Today (UTC)</h2>
 <div class="stats">
@@ -475,31 +500,33 @@ function renderStats(c, records) {
   <div class="stat hero"><div class="n">${c.recovery_rate}%</div><div class="l">recovery rate</div></div>
   <div class="stat hero"><div class="n">${c.revenue_recovered.toFixed(0)}</div><div class="l">revenue recovered</div></div>
   <div class="stat"><div class="n">${c.completed_no_call}</div><div class="l">paid before call</div></div>
+  <div class="stat"><div class="n">${c.no_phone}</div><div class="l">no phone left</div></div>
   <div class="stat"><div class="n">${c.skipped}</div><div class="l">skipped (test)</div></div>
   <div class="stat"><div class="n">${c.failed}</div><div class="l">errors</div></div>
 </div>
 
 <h2>Abandoned checkouts (${records.length} total)</h2>
-${records.length === 0 ? '<p class="muted">No abandoned checkouts yet. Try one on your dev store.</p>' : `
-<table>
-  <tr><th>When</th><th>Customer</th><th>Cart</th><th>Outcome</th><th></th></tr>
-  ${records.slice(0, 100).map(renderRow).join('')}
-</table>`}
+${records.length === 0 ? '<p class="muted">No abandoned checkouts yet.</p>' : `
+<table><tr><th>When</th><th>Customer</th><th>Cart</th><th>Outcome</th><th></th></tr>
+${records.slice(0, 100).map(renderRow).join('')}</table>`}
 
-<p class="muted" style="margin-top: 2rem; font-size: 12px;">Auto-refreshes every 15s. Click "details" on any row to see the transcript and event log. State is in-memory and resets on deploy.</p>
+<p class="muted" style="margin-top: 2rem; font-size: 12px;">Auto-refresh every 15s. Click "details" on any row to see transcript and event log. State is in-memory and resets on deploy.</p>
 </body></html>`;
 }
 
 app.get('/', (req, res) =>
-  res.send(`cartback up - mode=${MODE} - ${checkouts.size} tracked\nStats: ${STATS_SECRET ? '/stats/' + STATS_SECRET : '/stats'}`)
+  res.send(`cartback up - mode=${MODE} - ${checkouts.size} tracked\nStats: ${STATS_SECRET ? '/stats/' + STATS_SECRET : '/stats'}\nShopify API: ${SHOPIFY_STORE_DOMAIN && SHOPIFY_ADMIN_TOKEN ? 'connected' : 'NOT CONFIGURED'}`)
 );
 
 app.listen(PORT, () => {
   console.log(`cartback listening on :${PORT} (mode=${MODE})`);
   if (MODE === 'test') {
     console.log(`allowed phones: ${ALLOWED_PHONES.length ? ALLOWED_PHONES.join(', ') : '(none)'}`);
-  } else {
-    console.log('WARNING: live mode - will call every abandoned checkout with a phone');
   }
-  if (!STATS_SECRET) console.warn('WARNING: STATS_SECRET not set, /stats is publicly accessible');
+  if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_ADMIN_TOKEN) {
+    console.warn('SHOPIFY_STORE_DOMAIN or SHOPIFY_ADMIN_TOKEN not set - cannot fetch latest checkout state on timer');
+  } else {
+    console.log(`Shopify API: ${SHOPIFY_STORE_DOMAIN}`);
+  }
+  if (!STATS_SECRET) console.warn('WARNING: STATS_SECRET not set');
 });
